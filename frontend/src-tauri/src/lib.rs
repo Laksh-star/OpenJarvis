@@ -8,6 +8,9 @@ use tokio::sync::Mutex;
 
 const OLLAMA_PORT: u16 = 11434;
 const JARVIS_PORT: u16 = 8000;
+const MLX_PORT: u16 = 8080;
+const AGENT_LAB_OLLAMA_MODEL: &str = "qwen3.5:9b";
+const AGENT_LAB_MLX_MODEL: &str = "mlx-community/Qwen2.5-7B-Instruct-4bit";
 
 /// Small, fast model pulled at startup so the app opens quickly.
 const STARTUP_MODEL: &str = "qwen3.5:4b";
@@ -194,6 +197,7 @@ fn resolve_bin(name: &str) -> String {
         format!("{home}/.cargo/bin/{name}"),
         format!("/usr/local/bin/{name}"),
         format!("/usr/bin/{name}"),
+        format!("/Applications/Ollama.app/Contents/Resources/{name}"),
     ];
 
     #[cfg(target_os = "windows")]
@@ -376,7 +380,9 @@ const STDERR_TAIL_LIMIT: usize = 16 * 1024;
 struct BackendManager {
     ollama: Option<ChildHandle>,
     jarvis: Option<ChildHandle>,
+    mlx: Option<ChildHandle>,
     jarvis_stderr_tail: StderrTail,
+    mlx_stderr_tail: StderrTail,
 }
 
 impl Default for BackendManager {
@@ -384,7 +390,9 @@ impl Default for BackendManager {
         Self {
             ollama: None,
             jarvis: None,
+            mlx: None,
             jarvis_stderr_tail: Arc::new(Mutex::new(Vec::new())),
+            mlx_stderr_tail: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -399,6 +407,10 @@ impl BackendManager {
             h.kill().await;
         }
         self.ollama = None;
+        if let Some(ref mut h) = self.mlx {
+            h.kill().await;
+        }
+        self.mlx = None;
     }
 }
 
@@ -479,6 +491,196 @@ async fn endpoint_reachable(host: &str, timeout: Duration) -> bool {
     false
 }
 
+async fn url_json(url: &str, timeout_secs: u64) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Connection failed: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status));
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("Invalid response: {}", e))
+}
+
+async fn post_json(
+    url: &str,
+    payload: serde_json::Value,
+    timeout_secs: u64,
+) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Connection failed: {}", e))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+    serde_json::from_str(&body).map_err(|e| format!("Invalid response: {}", e))
+}
+
+async fn mlx_chat_ready() -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", MLX_PORT);
+    post_json(
+        &url,
+        serde_json::json!({
+            "model": "default_model",
+            "messages": [{"role": "user", "content": "Say ok."}],
+            "max_tokens": 8,
+            "temperature": 0,
+            "stream": false,
+        }),
+        60,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn start_ollama_service(backend: &SharedBackend) -> Result<(), String> {
+    let tags_url = format!("http://127.0.0.1:{}/api/tags", OLLAMA_PORT);
+    if wait_for_url(&tags_url, Duration::from_secs(1)).await {
+        return Ok(());
+    }
+
+    let ollama_bin = resolve_bin("ollama");
+    let child = tokio::process::Command::new(&ollama_bin)
+        .arg("serve")
+        .env("OLLAMA_HOST", format!("127.0.0.1:{}", OLLAMA_PORT))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Could not start Ollama using `{}`: {}", ollama_bin, e))?;
+    backend.lock().await.ollama = Some(ChildHandle { child });
+
+    if wait_for_url(&tags_url, Duration::from_secs(30)).await {
+        Ok(())
+    } else {
+        Err("Ollama did not become ready on port 11434.".into())
+    }
+}
+
+async fn start_mlx_service(backend: &SharedBackend) -> Result<(), String> {
+    let models_url = format!("http://127.0.0.1:{}/v1/models", MLX_PORT);
+    if wait_for_url(&models_url, Duration::from_secs(1)).await {
+        return mlx_chat_ready().await;
+    }
+
+    let root = find_project_root().ok_or_else(|| {
+        "Could not find the OpenJarvis project root. Set OPENJARVIS_ROOT and retry.".to_string()
+    })?;
+    let uv_bin = resolve_bin("uv");
+    sync_uv_extras(&root, &uv_bin, &["server", "inference-mlx"]).await?;
+    {
+        let tail = backend.lock().await.mlx_stderr_tail.clone();
+        tail.lock().await.clear();
+    }
+    let port = MLX_PORT.to_string();
+    let mut child = tokio::process::Command::new(&uv_bin)
+        .args([
+            "run",
+            "python",
+            "-m",
+            "mlx_lm",
+            "server",
+            "--model",
+            AGENT_LAB_MLX_MODEL,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(&root)
+        .spawn()
+        .map_err(|e| format!("Could not start MLX using `{}`: {}", uv_bin, e))?;
+
+    if let Some(stderr) = child.stderr.take() {
+        let tail = backend.lock().await.mlx_stderr_tail.clone();
+        spawn_stderr_drainer(stderr, tail);
+    }
+    backend.lock().await.mlx = Some(ChildHandle { child });
+
+    if !wait_for_url(&models_url, Duration::from_secs(90)).await {
+        let stderr = read_mlx_stderr_tail(backend).await;
+        return Err(format!(
+            "MLX did not become ready on port 8080.{}",
+            if stderr.is_empty() {
+                "".to_string()
+            } else {
+                format!(" Last MLX output:\n{}", stderr)
+            }
+        ));
+    }
+    if let Err(exc) = mlx_chat_ready().await {
+        let stderr = read_mlx_stderr_tail(backend).await;
+        return Err(format!(
+            "MLX started but chat completion failed: {}{}",
+            exc,
+            if stderr.is_empty() {
+                "".to_string()
+            } else {
+                format!("\nLast MLX output:\n{}", stderr)
+            }
+        ));
+    }
+    Ok(())
+}
+
+async fn start_jarvis_service(backend: &SharedBackend) -> Result<(), String> {
+    let health_url = format!("http://127.0.0.1:{}/health", JARVIS_PORT);
+    if wait_for_url(&health_url, Duration::from_secs(1)).await {
+        return Ok(());
+    }
+
+    let root = find_project_root().ok_or_else(|| {
+        "Could not find the OpenJarvis project root. Set OPENJARVIS_ROOT and retry.".to_string()
+    })?;
+    let uv_bin = resolve_bin("uv");
+    let port = JARVIS_PORT.to_string();
+    let child = tokio::process::Command::new(&uv_bin)
+        .args([
+            "run",
+            "jarvis",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--engine",
+            "ollama",
+            "--model",
+            AGENT_LAB_OLLAMA_MODEL,
+        ])
+        .env("OPENJARVIS_NO_UPDATE_CHECK", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .current_dir(root)
+        .spawn()
+        .map_err(|e| format!("Could not start OpenJarvis API using `{}`: {}", uv_bin, e))?;
+    backend.lock().await.jarvis = Some(ChildHandle { child });
+
+    if wait_for_url(&health_url, Duration::from_secs(90)).await {
+        Ok(())
+    } else {
+        Err("OpenJarvis API did not become ready on port 8000.".into())
+    }
+}
+
 /// Outcome of waiting for `jarvis serve` to become healthy.
 ///
 /// Unlike [`wait_for_url`] this differentiates "server is up but degraded"
@@ -511,7 +713,7 @@ enum JarvisStartResult {
 ///
 /// Returns immediately after spawning the task; the task ends naturally
 /// when the child closes stderr (i.e. exits).
-fn spawn_jarvis_stderr_drainer(mut stderr: tokio::process::ChildStderr, tail: StderrTail) {
+fn spawn_stderr_drainer(mut stderr: tokio::process::ChildStderr, tail: StderrTail) {
     use tokio::io::AsyncReadExt;
     tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
@@ -538,6 +740,12 @@ fn spawn_jarvis_stderr_drainer(mut stderr: tokio::process::ChildStderr, tail: St
 /// drainer has seen any bytes. Trimmed.
 async fn read_jarvis_stderr_tail(backend: &SharedBackend) -> String {
     let tail = backend.lock().await.jarvis_stderr_tail.clone();
+    let bytes = tail.lock().await.clone();
+    String::from_utf8_lossy(&bytes).trim().to_string()
+}
+
+async fn read_mlx_stderr_tail(backend: &SharedBackend) -> String {
+    let tail = backend.lock().await.mlx_stderr_tail.clone();
     let bytes = tail.lock().await.clone();
     String::from_utf8_lossy(&bytes).trim().to_string()
 }
@@ -664,17 +872,27 @@ async fn pull_model(model: &str) -> Result<(), String> {
 fn uv_sync_stderr_tail(stderr: &str, max_chars: usize) -> String {
     let total = stderr.chars().count();
     let skip = total.saturating_sub(max_chars);
-    stderr.chars().skip(skip).collect::<String>().trim().to_string()
+    stderr
+        .chars()
+        .skip(skip)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Error message shown when `uv sync` runs but exits non-zero (#331).
 ///
 /// `exit_code` is `None` when the process was terminated by a signal with
 /// no exit code (rendered as "unknown" rather than a misleading -1).
-fn format_uv_sync_failure(
+fn format_uv_sync_failure(root: &std::path::Path, exit_code: Option<i32>, stderr: &str) -> String {
+    format_uv_sync_failure_with_command(root, exit_code, stderr, "uv sync --extra server")
+}
+
+fn format_uv_sync_failure_with_command(
     root: &std::path::Path,
     exit_code: Option<i32>,
     stderr: &str,
+    suggested_command: &str,
 ) -> String {
     let code = exit_code
         .map(|c| c.to_string())
@@ -682,10 +900,11 @@ fn format_uv_sync_failure(
     format!(
         "`uv sync` failed in {} (exit {}). Last output:\n\n{}\n\n\
          Try opening a terminal in that directory and running \
-         `uv sync --extra server` manually for the full output.",
+         `{}` manually for the full output.",
         root.display(),
         code,
         uv_sync_stderr_tail(stderr, 800),
+        suggested_command,
     )
 }
 
@@ -699,6 +918,43 @@ fn format_uv_sync_spawn_error(root: &std::path::Path, uv_bin: &str, err: &str) -
         uv_bin,
         root.display(),
     )
+}
+
+async fn sync_uv_extras(
+    root: &std::path::Path,
+    uv_bin: &str,
+    extras: &[&str],
+) -> Result<(), String> {
+    let mut args = vec!["sync".to_string()];
+    for extra in extras {
+        args.push("--extra".to_string());
+        args.push((*extra).to_string());
+    }
+    let suggested_command = format!(
+        "uv {}",
+        args.iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let output = tokio::process::Command::new(uv_bin)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(root)
+        .output()
+        .await
+        .map_err(|e| format_uv_sync_spawn_error(root, uv_bin, &e.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format_uv_sync_failure_with_command(
+            root,
+            output.status.code(),
+            &stderr,
+            &suggested_command,
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -833,7 +1089,11 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
             s.error = Some(format!(
                 "Could not reach your custom inference server at {}. \
                  Start the server (e.g. LM Studio) and check the URL in Settings, then relaunch.",
-                if host.is_empty() { "(no URL set)" } else { host.as_str() }
+                if host.is_empty() {
+                    "(no URL set)"
+                } else {
+                    host.as_str()
+                }
             ));
             return;
         }
@@ -1042,9 +1302,12 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     let sync_output = tokio::process::Command::new(&uv_bin)
         .args([
             "sync",
-            "--extra", "server",
-            "--extra", "inference-cloud",
-            "--extra", "inference-google",
+            "--extra",
+            "server",
+            "--extra",
+            "inference-cloud",
+            "--extra",
+            "inference-google",
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -1116,7 +1379,7 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
             mgr.jarvis = Some(ChildHandle { child });
             drop(mgr);
             if let Some(stderr) = stderr_handle {
-                spawn_jarvis_stderr_drainer(stderr, tail);
+                spawn_stderr_drainer(stderr, tail);
             }
         }
         Err(e) => {
@@ -1254,6 +1517,141 @@ async fn start_backend(
 async fn stop_backend(backend: tauri::State<'_, SharedBackend>) -> Result<(), String> {
     backend.lock().await.stop_all().await;
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct AgentLabServiceStatus {
+    ollama_ready: bool,
+    mlx_ready: bool,
+    api_ready: bool,
+    ollama_managed: bool,
+    mlx_managed: bool,
+    api_managed: bool,
+    ollama_models: Vec<String>,
+    mlx_models: Vec<String>,
+    api_models: Vec<String>,
+    message: String,
+}
+
+fn extract_model_ids(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .or_else(|| {
+            value.get("data").and_then(|m| m.as_array()).map(|models| {
+                models
+                    .iter()
+                    .filter_map(|m| m.get("id").and_then(|n| n.as_str()))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+async fn agent_lab_service_status(
+    backend: tauri::State<'_, SharedBackend>,
+) -> Result<AgentLabServiceStatus, String> {
+    let ollama_json = url_json(&format!("http://127.0.0.1:{}/api/tags", OLLAMA_PORT), 2).await;
+    let mlx_json = url_json(&format!("http://127.0.0.1:{}/v1/models", MLX_PORT), 2).await;
+    let api_health = url_json(&format!("http://127.0.0.1:{}/health", JARVIS_PORT), 2).await;
+    let api_models_json = url_json(&format!("http://127.0.0.1:{}/v1/models", JARVIS_PORT), 2).await;
+
+    let mgr = backend.lock().await;
+    let ollama_ready = ollama_json.is_ok();
+    let mlx_ready = mlx_json.is_ok();
+    let api_ready = api_health.is_ok();
+    let message = if api_ready && ollama_ready {
+        "Agent Lab is ready for Ollama sample runs.".to_string()
+    } else if !api_ready {
+        "Start the OpenJarvis API before running samples.".to_string()
+    } else if !ollama_ready {
+        "Start Ollama before Ollama sample runs.".to_string()
+    } else {
+        "Services are partially ready.".to_string()
+    };
+
+    Ok(AgentLabServiceStatus {
+        ollama_ready,
+        mlx_ready,
+        api_ready,
+        ollama_managed: mgr.ollama.is_some(),
+        mlx_managed: mgr.mlx.is_some(),
+        api_managed: mgr.jarvis.is_some(),
+        ollama_models: ollama_json
+            .as_ref()
+            .map(extract_model_ids)
+            .unwrap_or_default(),
+        mlx_models: mlx_json.as_ref().map(extract_model_ids).unwrap_or_default(),
+        api_models: api_models_json
+            .as_ref()
+            .map(extract_model_ids)
+            .unwrap_or_default(),
+        message,
+    })
+}
+
+#[tauri::command]
+async fn agent_lab_start_service(
+    service: String,
+    backend: tauri::State<'_, SharedBackend>,
+) -> Result<AgentLabServiceStatus, String> {
+    let shared = backend.inner().clone();
+    match service.as_str() {
+        "ollama" => start_ollama_service(&shared).await?,
+        "mlx" => start_mlx_service(&shared).await?,
+        "api" => start_jarvis_service(&shared).await?,
+        "all" => {
+            start_ollama_service(&shared).await?;
+            if !ollama_has_model(AGENT_LAB_OLLAMA_MODEL).await {
+                pull_model(AGENT_LAB_OLLAMA_MODEL).await?;
+            }
+            start_jarvis_service(&shared).await?;
+        }
+        other => return Err(format!("Unknown Agent Lab service: {}", other)),
+    }
+    agent_lab_service_status(backend).await
+}
+
+#[tauri::command]
+async fn agent_lab_stop_service(
+    service: String,
+    backend: tauri::State<'_, SharedBackend>,
+) -> Result<AgentLabServiceStatus, String> {
+    {
+        let mut mgr = backend.lock().await;
+        match service.as_str() {
+            "ollama" => {
+                if let Some(ref mut h) = mgr.ollama {
+                    h.kill().await;
+                }
+                mgr.ollama = None;
+            }
+            "mlx" => {
+                if let Some(ref mut h) = mgr.mlx {
+                    h.kill().await;
+                }
+                mgr.mlx = None;
+            }
+            "api" => {
+                if let Some(ref mut h) = mgr.jarvis {
+                    h.kill().await;
+                }
+                mgr.jarvis = None;
+            }
+            "all" => mgr.stop_all().await,
+            other => return Err(format!("Unknown Agent Lab service: {}", other)),
+        }
+    }
+    agent_lab_service_status(backend).await
 }
 
 #[tauri::command]
@@ -1748,7 +2146,8 @@ fn write_inference_config(cfg: &InferenceConfig) -> Result<(), String> {
         let _ = std::fs::create_dir_all(parent);
     }
     let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json + "\n").map_err(|e| format!("Failed to save inference config: {}", e))
+    std::fs::write(&path, json + "\n")
+        .map_err(|e| format!("Failed to save inference config: {}", e))
 }
 
 /// Upsert `[engine.<engine>] host = "<host>"` into an existing config.toml
@@ -1906,7 +2305,7 @@ mod native_overlay {
         // Also inject CSS to nuke any remaining background
         let js = nsstring(
             "document.documentElement.style.background='transparent';\
-             document.body.style.background='transparent';"
+             document.body.style.background='transparent';",
         );
         let nil: *mut Object = std::ptr::null_mut();
         let _: () = msg_send![wv, evaluateJavaScript: js completionHandler: nil];
@@ -1937,7 +2336,9 @@ mod native_overlay {
             let sup = Class::get("NSObject").unwrap();
             let mut decl = ClassDecl::new("JarvisOverlayNavDelegate", sup).unwrap();
             extern "C" fn did_finish(_: &Object, _: Sel, wv: *mut Object, _nav: *mut Object) {
-                unsafe { force_transparent(wv); }
+                unsafe {
+                    force_transparent(wv);
+                }
             }
             decl.add_method(
                 sel!(webView:didFinishNavigation:),
@@ -2289,6 +2690,9 @@ pub fn run() {
             get_api_base,
             start_backend,
             stop_backend,
+            agent_lab_service_status,
+            agent_lab_start_service,
+            agent_lab_stop_service,
             check_health,
             fetch_energy,
             fetch_telemetry,
@@ -2406,10 +2810,10 @@ mod tests {
     #[test]
     fn default_local_model_picks_second_largest_that_fits() {
         // QWEN35_MODELS min_ram ladder: 4,6,8,12,24,32,96 GB
-        assert_eq!(default_local_model(4.0), "qwen3.5:0.8b");  // only one fits
-        assert_eq!(default_local_model(8.0), "qwen3.5:2b");    // fits 0.8/2/4 → 2nd-largest
-        assert_eq!(default_local_model(16.0), "qwen3.5:4b");   // fits ..9b → 2nd-largest
-        assert_eq!(default_local_model(32.0), "qwen3.5:27b");  // fits 0.8/2/4/9/27/35b → 2nd-largest is 27b
+        assert_eq!(default_local_model(4.0), "qwen3.5:0.8b"); // only one fits
+        assert_eq!(default_local_model(8.0), "qwen3.5:2b"); // fits 0.8/2/4 → 2nd-largest
+        assert_eq!(default_local_model(16.0), "qwen3.5:4b"); // fits ..9b → 2nd-largest
+        assert_eq!(default_local_model(32.0), "qwen3.5:27b"); // fits 0.8/2/4/9/27/35b → 2nd-largest is 27b
         assert_eq!(default_local_model(128.0), "qwen3.5:35b"); // fits all → 2nd-largest
     }
 
@@ -2420,8 +2824,14 @@ mod tests {
 
     #[test]
     fn parse_defaults_to_ollama_when_file_missing_or_garbage() {
-        assert!(matches!(parse_inference_config("").kind, SourceKind::Ollama));
-        assert!(matches!(parse_inference_config("not json").kind, SourceKind::Ollama));
+        assert!(matches!(
+            parse_inference_config("").kind,
+            SourceKind::Ollama
+        ));
+        assert!(matches!(
+            parse_inference_config("not json").kind,
+            SourceKind::Ollama
+        ));
     }
 
     #[test]
@@ -2437,21 +2847,39 @@ mod tests {
 
     #[test]
     fn normalize_host_strips_trailing_slash_and_v1() {
-        assert_eq!(normalize_host("http://localhost:1234/v1"), "http://localhost:1234");
-        assert_eq!(normalize_host("http://localhost:1234/v1/"), "http://localhost:1234");
-        assert_eq!(normalize_host("http://localhost:1234/"), "http://localhost:1234");
+        assert_eq!(
+            normalize_host("http://localhost:1234/v1"),
+            "http://localhost:1234"
+        );
+        assert_eq!(
+            normalize_host("http://localhost:1234/v1/"),
+            "http://localhost:1234"
+        );
+        assert_eq!(
+            normalize_host("http://localhost:1234/"),
+            "http://localhost:1234"
+        );
         assert_eq!(normalize_host("http://host:8000"), "http://host:8000");
     }
 
     #[test]
     fn boot_plan_ollama_launches_and_pulls_one_model() {
-        let cfg = InferenceConfig { kind: SourceKind::Ollama, ..Default::default() };
+        let cfg = InferenceConfig {
+            kind: SourceKind::Ollama,
+            ..Default::default()
+        };
         let plan = boot_plan(&cfg, 16.0);
         assert!(plan.launch_ollama);
         assert_eq!(plan.model_to_pull.as_deref(), Some("qwen3.5:4b"));
         assert!(plan.engine_host.is_none());
-        assert!(plan.serve_args.windows(2).any(|w| w == ["--engine", "ollama"]));
-        assert!(plan.serve_args.windows(2).any(|w| w == ["--model", "qwen3.5:4b"]));
+        assert!(plan
+            .serve_args
+            .windows(2)
+            .any(|w| w == ["--engine", "ollama"]));
+        assert!(plan
+            .serve_args
+            .windows(2)
+            .any(|w| w == ["--model", "qwen3.5:4b"]));
     }
 
     #[test]
@@ -2480,8 +2908,14 @@ mod tests {
             plan.engine_host,
             Some(("lmstudio".to_string(), "http://localhost:1234".to_string()))
         );
-        assert!(plan.serve_args.windows(2).any(|w| w == ["--engine", "lmstudio"]));
-        assert!(plan.serve_args.windows(2).any(|w| w == ["--model", "qwen2.5-7b"]));
+        assert!(plan
+            .serve_args
+            .windows(2)
+            .any(|w| w == ["--engine", "lmstudio"]));
+        assert!(plan
+            .serve_args
+            .windows(2)
+            .any(|w| w == ["--model", "qwen2.5-7b"]));
     }
 
     #[test]
@@ -2494,7 +2928,10 @@ mod tests {
         };
         let plan = boot_plan(&cfg, 16.0);
         assert_eq!(plan.engine_host.as_ref().unwrap().0, "lmstudio");
-        assert!(plan.serve_args.windows(2).any(|w| w == ["--engine", "lmstudio"]));
+        assert!(plan
+            .serve_args
+            .windows(2)
+            .any(|w| w == ["--engine", "lmstudio"]));
     }
 
     #[test]
@@ -2513,7 +2950,10 @@ mod tests {
     #[test]
     fn boot_plan_ollama_uses_fallback_model_on_low_ram() {
         // Below the smallest model's min_ram → default_local_model → FALLBACK_MODEL.
-        let cfg = InferenceConfig { kind: SourceKind::Ollama, ..Default::default() };
+        let cfg = InferenceConfig {
+            kind: SourceKind::Ollama,
+            ..Default::default()
+        };
         let plan = boot_plan(&cfg, 1.0);
         assert_eq!(plan.model_to_pull.as_deref(), Some(super::FALLBACK_MODEL));
     }
@@ -2533,8 +2973,14 @@ mod tests {
         let existing = "[intelligence]\ndefault_model = \"keep-me\"\n";
         let out = upsert_engine_host(existing, "vllm", "http://host:8000").unwrap();
         let doc: toml_edit::DocumentMut = out.parse().unwrap();
-        assert_eq!(doc["intelligence"]["default_model"].as_str(), Some("keep-me"));
-        assert_eq!(doc["engine"]["vllm"]["host"].as_str(), Some("http://host:8000"));
+        assert_eq!(
+            doc["intelligence"]["default_model"].as_str(),
+            Some("keep-me")
+        );
+        assert_eq!(
+            doc["engine"]["vllm"]["host"].as_str(),
+            Some("http://host:8000")
+        );
     }
 
     #[test]
@@ -2542,6 +2988,9 @@ mod tests {
         let existing = "[engine.lmstudio]\nhost = \"http://old:1\"\n";
         let out = upsert_engine_host(existing, "lmstudio", "http://new:2").unwrap();
         let doc: toml_edit::DocumentMut = out.parse().unwrap();
-        assert_eq!(doc["engine"]["lmstudio"]["host"].as_str(), Some("http://new:2"));
+        assert_eq!(
+            doc["engine"]["lmstudio"]["host"].as_str(),
+            Some("http://new:2")
+        );
     }
 }

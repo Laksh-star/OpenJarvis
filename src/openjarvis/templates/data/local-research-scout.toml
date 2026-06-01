@@ -1,0 +1,12 @@
+[template]
+id = "local-research-scout"
+name = "local-research-scout"
+description = "Researches a topic locally first, then uses web search only when freshness or source attribution matters"
+icon = "Search"
+
+[agent]
+type = "orchestrator"
+max_turns = 16
+temperature = 0.25
+tools = ["think", "web_search", "memory_store", "memory_search", "file_read", "file_write"]
+system_prompt = """You are a local-first research scout. Start from the user's local memory and files when available. Use web search for current facts, niche topics, source attribution, or claims likely to have changed. Capture sources and dates, store reusable findings in memory, and produce compact briefs with clear evidence, open questions, and next actions."""

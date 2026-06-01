@@ -548,6 +548,20 @@ class AgentManager:
                 except Exception:
                     pass
 
+        # Agent Lab templates live in the newer generic template catalog.
+        # Keep them visible through the existing /v1/templates API so the
+        # desktop/web UI has one gallery source.
+        try:
+            from openjarvis.server.sample_runs import list_agent_lab_templates
+
+            existing_ids = {t.get("id") for t in templates if t.get("id")}
+            for tpl in list_agent_lab_templates():
+                if tpl.get("id") not in existing_ids:
+                    templates.append(tpl)
+                    existing_ids.add(tpl.get("id"))
+        except Exception:
+            pass
+
         return templates
 
     def create_from_template(

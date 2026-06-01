@@ -909,7 +909,15 @@ def include_all_routes(app) -> None:
     app.include_router(feedback_router)
     app.include_router(optimize_router)
 
+    from openjarvis.server.sample_runs import (  # noqa: PLC0415
+        create_sample_runs_router,
+        create_templates_fallback_router,
+    )
+
+    app.include_router(create_sample_runs_router())
+
     # Agent Manager routes (if available)
+    included_manager_templates = False
     try:
         if hasattr(app.state, "agent_manager") and app.state.agent_manager:
             from openjarvis.server.agent_manager_routes import (  # noqa: PLC0415
@@ -925,11 +933,14 @@ def include_all_routes(app) -> None:
             ) = create_agent_manager_router(app.state.agent_manager)
             app.include_router(agents_r)
             app.include_router(templates_r)
+            included_manager_templates = True
             app.include_router(global_r)
             app.include_router(tools_r)
             app.include_router(sendblue_r)
     except ImportError:
         pass
+    if not included_manager_templates:
+        app.include_router(create_templates_fallback_router())
 
     # WebSocket bridge for real-time agent events
     try:

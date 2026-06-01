@@ -359,6 +359,49 @@ export interface AgentTemplate {
   [key: string]: unknown;
 }
 
+export interface SampleScenario {
+  id: string;
+  title: string;
+  template_id: string;
+  template_name: string;
+  summary: string;
+  prompt: string;
+  allowed_tools: string[];
+  timeout_seconds: number;
+  validators: { key: string; label: string }[];
+}
+
+export interface SampleRunResult {
+  run_id: string;
+  scenario_id: string;
+  template_id: string;
+  status: 'queued' | 'running' | 'passed' | 'failed' | 'error';
+  engine: string;
+  model: string;
+  content: string;
+  checks: { key: string; label: string; passed: boolean }[];
+  tool_calls: unknown[];
+  allowed_tools?: string[];
+  usage: Record<string, unknown>;
+  latency_seconds: number;
+  trace_id: string | null;
+  error: string | null;
+  created_at: number;
+}
+
+export interface AgentLabServiceStatus {
+  ollama_ready: boolean;
+  mlx_ready: boolean;
+  api_ready: boolean;
+  ollama_managed: boolean;
+  mlx_managed: boolean;
+  api_managed: boolean;
+  ollama_models: string[];
+  mlx_models: string[];
+  api_models: string[];
+  message: string;
+}
+
 export interface PersistedToolCall {
   tool: string;
   arguments: string;
@@ -563,6 +606,70 @@ export async function fetchTemplates(): Promise<AgentTemplate[]> {
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
   const data = await res.json();
   return data.templates || [];
+}
+
+export async function fetchSampleRuns(): Promise<{
+  scenarios: SampleScenario[];
+  templates: AgentTemplate[];
+}> {
+  const res = await fetch(`${getBase()}/v1/sample-runs`);
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function executeSampleRun(
+  scenarioId: string,
+  body: {
+    prompt?: string;
+    engine?: 'auto' | 'current' | 'ollama' | 'mlx';
+    model?: string;
+    max_turns?: number;
+    temperature?: number;
+    tools?: string[];
+  },
+): Promise<SampleRunResult> {
+  const res = await fetch(`${getBase()}/v1/sample-runs/${scenarioId}/execute`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || `Failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function fetchSampleRun(runId: string): Promise<SampleRunResult> {
+  const res = await fetch(`${getBase()}/v1/sample-runs/${runId}`);
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchAgentLabServiceStatus(): Promise<AgentLabServiceStatus | null> {
+  if (!isTauri()) return null;
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<AgentLabServiceStatus>('agent_lab_service_status');
+  } catch {
+    return null;
+  }
+}
+
+export async function startAgentLabService(
+  service: 'ollama' | 'mlx' | 'api' | 'all',
+): Promise<AgentLabServiceStatus> {
+  if (!isTauri()) throw new Error('Service launcher is available in the desktop app.');
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<AgentLabServiceStatus>('agent_lab_start_service', { service });
+}
+
+export async function stopAgentLabService(
+  service: 'ollama' | 'mlx' | 'api' | 'all',
+): Promise<AgentLabServiceStatus> {
+  if (!isTauri()) throw new Error('Service controls are available in the desktop app.');
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<AgentLabServiceStatus>('agent_lab_stop_service', { service });
 }
 
 export async function runManagedAgent(agentId: string): Promise<void> {
