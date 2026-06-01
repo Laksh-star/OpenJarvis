@@ -173,6 +173,7 @@ nav:
       - Pearl Mining: user-guide/mining.md
       - Pearl Mining on Apple Silicon: user-guide/mining-apple-silicon.md
       - Python SDK: user-guide/python-sdk.md
+      - Agent Lab: user-guide/agent-lab.md
       - Morning Digest: user-guide/morning-digest.md
       - Deep Research: user-guide/deep-research.md
       - Code Assistant: user-guide/code-assistant.md
@@ -190,5 +191,7 @@ nav:
   - Leaderboard: leaderboard.md
   - Roadmap: development/roadmap.md
   - Development:
+      - Agent Lab README: agent-lab/README.md
+      - Agent Lab Test Report: testing/agent-lab-test-report.md
       - Mining: development/mining.md
       - Pearl Model Enablement: development/pearl-model-enablement.md
