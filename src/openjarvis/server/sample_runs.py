@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -43,9 +46,79 @@ class SampleExecuteRequest(BaseModel):
     max_turns: Optional[int] = Field(default=None, ge=1, le=30)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     tools: Optional[List[str]] = None
+    repo_path: Optional[str] = None
 
 
 _SCENARIOS: tuple[SampleScenario, ...] = (
+    SampleScenario(
+        id="repo-triage-workbench",
+        title="Repo Triage Workbench",
+        template_id="local-codebase-maintainer",
+        summary=(
+            "Runs a real read-only local repo triage: lists files, searches "
+            "for relevant code, reads likely files, then asks the model for a "
+            "maintenance report grounded in those observations."
+        ),
+        prompt=(
+            "Investigate why the Agent Lab sample-run path does not execute "
+            "real tools. Find the relevant backend and frontend files, explain "
+            "the smallest safe fix, and list the tests to add. Do not modify files."
+        ),
+        allowed_tools=("repo_list", "repo_search", "file_read", "think"),
+        timeout_seconds=180,
+        validators=(
+            ValidatorSpec(
+                "mentions_evidence",
+                "Uses repo evidence",
+                ("file", "search", "evidence", "observed"),
+            ),
+            ValidatorSpec(
+                "mentions_fix",
+                "Proposes a fix",
+                ("fix", "change", "wire", "implement"),
+            ),
+            ValidatorSpec(
+                "mentions_tests",
+                "Includes tests",
+                ("test", "pytest", "frontend test", "coverage"),
+            ),
+        ),
+    ),
+    SampleScenario(
+        id="repo-release-readiness-agent",
+        title="Repo Release Readiness Agent",
+        template_id="local-codebase-maintainer",
+        summary=(
+            "Runs a real read-only release readiness review: inspects repo "
+            "structure, current git state, likely project/test/docs files, and "
+            "asks the model for a practical go/no-go report."
+        ),
+        prompt=(
+            "Review this repository for release readiness. Use local repo "
+            "evidence only. Identify likely blockers, test or build commands to "
+            "run, documentation gaps, and a clear go/no-go recommendation. Do "
+            "not modify files."
+        ),
+        allowed_tools=("repo_list", "git_status", "repo_search", "file_read", "think"),
+        timeout_seconds=180,
+        validators=(
+            ValidatorSpec(
+                "mentions_release_readiness",
+                "Gives release readiness judgment",
+                ("release", "ready", "go/no-go", "go", "no-go"),
+            ),
+            ValidatorSpec(
+                "mentions_blockers",
+                "Identifies blockers or risks",
+                ("blocker", "risk", "gap", "missing"),
+            ),
+            ValidatorSpec(
+                "mentions_verification",
+                "Includes verification commands",
+                ("test", "build", "pytest", "npm run build", "ruff"),
+            ),
+        ),
+    ),
     SampleScenario(
         id="local-codebase-maintainer-smoke",
         title="Codebase Maintainer Smoke",
@@ -150,6 +223,315 @@ _SCENARIOS: tuple[SampleScenario, ...] = (
 )
 
 _RUNS: Dict[str, Dict[str, Any]] = {}
+_REPO_BACKED_SCENARIO_IDS = {
+    "repo-triage-workbench",
+    "repo-release-readiness-agent",
+}
+_MAX_TOOL_RESULT_CHARS = 6000
+
+
+def _project_root() -> Path:
+    for candidate in [Path.cwd(), *Path.cwd().parents]:
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+    return Path.cwd()
+
+
+def _safe_repo_root(repo_path: Optional[str]) -> Path:
+    if repo_path and os.getenv("OPENJARVIS_AGENT_LAB_ALLOW_REPO_PATH") != "1":
+        raise ValueError(
+            "Custom repo_path is disabled. Run from the target repository or set "
+            "OPENJARVIS_AGENT_LAB_ALLOW_REPO_PATH=1 for local development."
+        )
+    root = Path(repo_path).expanduser() if repo_path else _project_root()
+    root = root.resolve()
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"Repo path is not a directory: {root}")
+    return root
+
+
+def _clip(value: str, limit: int = _MAX_TOOL_RESULT_CHARS) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"\n... truncated {len(value) - limit} chars"
+
+
+def _tool_call(
+    tool: str,
+    arguments: Dict[str, Any],
+    *,
+    result: str,
+    success: bool = True,
+    latency: float = 0.0,
+) -> Dict[str, Any]:
+    return {
+        "id": f"tool-{uuid.uuid4().hex[:8]}",
+        "tool": tool,
+        "arguments": arguments,
+        "result": _clip(result),
+        "success": success,
+        "latency": latency,
+    }
+
+
+def _run_repo_command(args: list[str], cwd: Path, timeout: int = 8) -> tuple[str, bool]:
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        return "", False
+    except subprocess.TimeoutExpired as exc:
+        out = (exc.stdout or "") + (exc.stderr or "")
+        return _clip(out or "Command timed out"), False
+    output = (completed.stdout or "") + (completed.stderr or "")
+    return output.strip(), completed.returncode in (0, 1)
+
+
+def _list_repo_files(repo_root: Path) -> tuple[list[str], Dict[str, Any]]:
+    started = time.perf_counter()
+    output, ok = _run_repo_command(["rg", "--files"], repo_root)
+    if not output:
+        files = [
+            str(path.relative_to(repo_root))
+            for path in repo_root.rglob("*")
+            if path.is_file() and ".git" not in path.parts
+        ][:200]
+        output = "\n".join(files)
+        ok = True
+    else:
+        files = output.splitlines()[:300]
+    call = _tool_call(
+        "repo_list",
+        {"repo_path": str(repo_root), "max_files": 300},
+        result="\n".join(files),
+        success=ok,
+        latency=time.perf_counter() - started,
+    )
+    return files, call
+
+
+def _git_status(repo_root: Path) -> tuple[str, Dict[str, Any]]:
+    started = time.perf_counter()
+    output, ok = _run_repo_command(["git", "status", "--short"], repo_root, timeout=5)
+    result = output or "Working tree appears clean or git status returned no entries."
+    call = _tool_call(
+        "git_status",
+        {"repo_path": str(repo_root)},
+        result=result,
+        success=ok,
+        latency=time.perf_counter() - started,
+    )
+    return result, call
+
+
+def _search_repo(repo_root: Path, prompt: str) -> tuple[str, Dict[str, Any]]:
+    patterns = [
+        "sample_runs",
+        "AgentLab",
+        "tool_calls",
+        "allowed_tools",
+        "execute_sample",
+    ]
+    if "mlx" in prompt.lower():
+        patterns.append("mlx")
+    if "release" in prompt.lower():
+        patterns.extend(
+            [
+                "pytest",
+                "ruff",
+                "npm run build",
+                "README",
+                "version",
+            ]
+        )
+    started = time.perf_counter()
+    combined: list[str] = []
+    for pattern in patterns:
+        output, ok = _run_repo_command(
+            ["rg", "-n", "--glob", "!frontend/node_modules/**", pattern],
+            repo_root,
+            timeout=5,
+        )
+        if output:
+            combined.append(f"## rg {pattern}\n{output}")
+        if not ok:
+            combined.append(f"## rg {pattern}\nsearch failed")
+    result = "\n\n".join(combined) or "No matching repo search results."
+    call = _tool_call(
+        "repo_search",
+        {"patterns": patterns},
+        result=result,
+        success=True,
+        latency=time.perf_counter() - started,
+    )
+    return result, call
+
+
+def _read_likely_files(
+    repo_root: Path, files: list[str], prompt: str = ""
+) -> tuple[str, list[Dict[str, Any]]]:
+    if "release" in prompt.lower():
+        likely = [
+            "README.md",
+            "package.json",
+            "pyproject.toml",
+            "tsconfig.json",
+            "src/index.ts",
+            "src/worker.ts",
+            "plugins/tmdb/README.md",
+            "frontend/package.json",
+            "tests/server/test_sample_runs.py",
+        ]
+    else:
+        likely = [
+            "README.md",
+            "pyproject.toml",
+            "src/openjarvis/server/sample_runs.py",
+            "frontend/package.json",
+            "frontend/src/pages/AgentLabPage.tsx",
+            "frontend/src/lib/api.ts",
+            "tests/server/test_sample_runs.py",
+        ]
+    available = [
+        path for path in likely if path in files or (repo_root / path).exists()
+    ]
+    calls: list[Dict[str, Any]] = []
+    sections: list[str] = []
+    for rel_path in available[:6]:
+        started = time.perf_counter()
+        path = (repo_root / rel_path).resolve()
+        try:
+            if repo_root not in path.parents and path != repo_root:
+                raise ValueError("Path escapes repo root")
+            text = path.read_text(encoding="utf-8", errors="replace")
+            result = _clip(text, 5000)
+            calls.append(
+                _tool_call(
+                    "file_read",
+                    {"path": rel_path},
+                    result=result,
+                    latency=time.perf_counter() - started,
+                )
+            )
+            sections.append(f"## {rel_path}\n{result}")
+        except Exception as exc:
+            calls.append(
+                _tool_call(
+                    "file_read",
+                    {"path": rel_path},
+                    result=str(exc),
+                    success=False,
+                    latency=time.perf_counter() - started,
+                )
+            )
+    return "\n\n".join(sections), calls
+
+
+def _execute_repo_triage_run(
+    request: Request,
+    *,
+    req: SampleExecuteRequest,
+    scenario: SampleScenario,
+    template: Dict[str, Any],
+    run_id: str,
+    engine,
+    engine_id: str,
+    model: str,
+) -> Dict[str, Any]:
+    prompt = req.prompt or scenario.prompt
+    allowed_tools = req.tools if req.tools is not None else list(scenario.allowed_tools)
+    repo_root = _safe_repo_root(req.repo_path)
+
+    started = time.perf_counter()
+    files, list_call = _list_repo_files(repo_root)
+    git_result, git_call = _git_status(repo_root)
+    search_result, search_call = _search_repo(repo_root, prompt)
+    file_evidence, read_calls = _read_likely_files(repo_root, files, prompt)
+    tool_calls = [list_call, git_call, search_call, *read_calls]
+
+    evidence_prompt = f"""
+You are running a read-only local repo triage for OpenJarvis Agent Lab.
+
+User task:
+{prompt}
+
+Repo root:
+{repo_root}
+
+Observed tool evidence follows. Ground your answer in these observations. Do
+not claim that files were modified.
+
+# Repo file listing
+{list_call["result"]}
+
+# Git status
+{git_result}
+
+# Repo search evidence
+{_clip(search_result)}
+
+# File evidence
+{_clip(file_evidence)}
+
+Return the requested repo report with:
+1. The files or code paths that appear relevant.
+2. The current risks, blockers, or readiness gaps.
+3. Tests, builds, or checks to add/run.
+4. A clear recommendation or next action.
+""".strip()
+    temperature = (
+        req.temperature
+        if req.temperature is not None
+        else float(template.get("temperature", 0.2))
+    )
+    max_turns = req.max_turns or int(template.get("max_turns", 10))
+    max_tokens = max(512, min(3072, max_turns * 220))
+
+    raw = engine.generate(
+        _build_messages(template, evidence_prompt),
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    latency = time.perf_counter() - started
+    content = raw.get("content", "")
+    checks = _validate_output(scenario, content)
+    status: SampleStatus = (
+        "passed" if checks and all(c["passed"] for c in checks) else "failed"
+    )
+    trace_id = f"sample-trace-{run_id}"
+    result = {
+        "run_id": run_id,
+        "scenario_id": scenario.id,
+        "template_id": scenario.template_id,
+        "status": status,
+        "engine": engine_id,
+        "model": raw.get("model", model),
+        "content": content,
+        "checks": checks,
+        "tool_calls": tool_calls,
+        "allowed_tools": allowed_tools,
+        "repo_path": str(repo_root),
+        "usage": raw.get("usage", {}),
+        "latency_seconds": latency,
+        "trace_id": trace_id,
+        "error": None,
+        "created_at": time.time(),
+    }
+    _save_trace(
+        request,
+        trace_id=trace_id,
+        scenario=scenario,
+        prompt=prompt,
+        result=result,
+    )
+    return result
 
 
 def _template_id_from_name(name: str) -> str:
@@ -319,6 +701,8 @@ def _save_trace(
             "sample_run_id": result["run_id"],
             "scenario_id": scenario.id,
             "checks": result.get("checks", []),
+            "tool_calls": result.get("tool_calls", []),
+            "repo_path": result.get("repo_path"),
         },
         messages=[
             {"role": "user", "content": prompt},
@@ -427,6 +811,31 @@ def create_sample_runs_router() -> APIRouter:
                 model,
                 f"{engine_id} is not reachable. Start the local engine and retry.",
             )
+            _RUNS[run_id] = result
+            return result
+
+        if scenario.id in _REPO_BACKED_SCENARIO_IDS:
+            try:
+                result = _execute_repo_triage_run(
+                    request,
+                    req=req,
+                    scenario=scenario,
+                    template=template,
+                    run_id=run_id,
+                    engine=engine,
+                    engine_id=engine_id,
+                    model=model,
+                )
+            except EngineConnectionError as exc:
+                result = _error_result(run_id, scenario, engine_id, model, str(exc))
+            except Exception as exc:
+                result = _error_result(
+                    run_id,
+                    scenario,
+                    engine_id,
+                    model,
+                    f"Sample run failed: {exc}",
+                )
             _RUNS[run_id] = result
             return result
 

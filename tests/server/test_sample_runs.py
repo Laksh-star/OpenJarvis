@@ -101,6 +101,127 @@ def test_execute_sample_run_returns_structured_pass_result(tmp_path, monkeypatch
     engine.generate.assert_called_once()
 
 
+def test_repo_triage_sample_run_returns_real_tool_calls(tmp_path, monkeypatch):
+    engine = _make_engine(
+        "Observed file evidence from repo search. Implement the smallest fix "
+        "by wiring real tool calls into the sample run path and add pytest "
+        "coverage plus a frontend test."
+    )
+    client = _make_client(engine, tmp_path, monkeypatch)
+
+    repo = tmp_path / "repo"
+    (repo / "src/openjarvis/server").mkdir(parents=True)
+    (repo / "frontend/src/pages").mkdir(parents=True)
+    (repo / "frontend/src/lib").mkdir(parents=True)
+    (repo / "tests/server").mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'sample'\n")
+    (repo / "src/openjarvis/server/sample_runs.py").write_text(
+        "def execute_sample():\n    return {'allowed_tools': []}\n"
+    )
+    (repo / "frontend/src/pages/AgentLabPage.tsx").write_text(
+        "export function AgentLabPage() { return 'Tool Timeline'; }\n"
+    )
+    (repo / "frontend/src/lib/api.ts").write_text(
+        "export async function executeSampleRun() {\n"
+        "  return fetch('/v1/sample-runs');\n"
+        "}\n"
+    )
+    (repo / "tests/server/test_sample_runs.py").write_text(
+        "def test_sample_runs():\n    assert True\n"
+    )
+    monkeypatch.setenv("OPENJARVIS_AGENT_LAB_ALLOW_REPO_PATH", "1")
+
+    resp = client.post(
+        "/v1/sample-runs/repo-triage-workbench/execute",
+        json={"engine": "current", "model": "sample-model", "repo_path": str(repo)},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "passed"
+    assert body["repo_path"] == str(repo)
+    assert {call["tool"] for call in body["tool_calls"]} >= {
+        "repo_list",
+        "repo_search",
+        "file_read",
+    }
+    assert any(
+        call["arguments"]["path"] == "src/openjarvis/server/sample_runs.py"
+        for call in body["tool_calls"]
+        if call["tool"] == "file_read"
+    )
+    engine.generate.assert_called_once()
+
+
+def test_repo_release_readiness_sample_returns_readiness_report(tmp_path, monkeypatch):
+    engine = _make_engine(
+        "Release readiness: go/no-go is conditional. Blocker risks include "
+        "missing docs and test gaps. Run pytest, ruff, and npm run build before "
+        "release."
+    )
+    client = _make_client(engine, tmp_path, monkeypatch)
+
+    repo = tmp_path / "release-repo"
+    (repo / "src/openjarvis/server").mkdir(parents=True)
+    (repo / "frontend/src/pages").mkdir(parents=True)
+    (repo / "frontend/src/lib").mkdir(parents=True)
+    (repo / "frontend").mkdir(exist_ok=True)
+    (repo / "tests/server").mkdir(parents=True)
+    (repo / "README.md").write_text("# Release Repo\n\nTODO: document release flow.\n")
+    (repo / "pyproject.toml").write_text(
+        "[project]\nname = 'release-repo'\nversion = '0.1.0'\n"
+    )
+    (repo / "tsconfig.json").write_text('{"compilerOptions": {}}\n')
+    (repo / "frontend/package.json").write_text(
+        '{"scripts":{"build":"tsc -b && vite build"}}\n'
+    )
+    (repo / "src/openjarvis/server/sample_runs.py").write_text(
+        "def sample_runs():\n    return []\n"
+    )
+    (repo / "src/index.ts").write_text(
+        'export const metadata = { version: "2.0.0" };\n'
+    )
+    (repo / "src/worker.ts").write_text(
+        'export const workerMetadata = { version: "2.0.0" };\n'
+    )
+    (repo / "frontend/src/pages/AgentLabPage.tsx").write_text(
+        "export function AgentLabPage() { return 'Agent Lab'; }\n"
+    )
+    (repo / "frontend/src/lib/api.ts").write_text("export const api = {};\n")
+    (repo / "tests/server/test_sample_runs.py").write_text(
+        "def test_sample_runs():\n    assert True\n"
+    )
+    monkeypatch.setenv("OPENJARVIS_AGENT_LAB_ALLOW_REPO_PATH", "1")
+
+    resp = client.post(
+        "/v1/sample-runs/repo-release-readiness-agent/execute",
+        json={"engine": "current", "model": "sample-model", "repo_path": str(repo)},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "passed"
+    assert {call["tool"] for call in body["tool_calls"]} >= {
+        "repo_list",
+        "git_status",
+        "repo_search",
+        "file_read",
+    }
+    read_paths = {
+        call["arguments"]["path"]
+        for call in body["tool_calls"]
+        if call["tool"] == "file_read"
+    }
+    assert {
+        "README.md",
+        "pyproject.toml",
+        "tsconfig.json",
+        "src/index.ts",
+    } <= read_paths
+    assert all(check["passed"] for check in body["checks"])
+    engine.generate.assert_called_once()
+
+
 def test_execute_sample_run_unreachable_engine_returns_actionable_error(
     tmp_path, monkeypatch
 ):

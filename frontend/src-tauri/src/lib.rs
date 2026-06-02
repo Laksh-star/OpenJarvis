@@ -667,6 +667,7 @@ async fn start_jarvis_service(backend: &SharedBackend) -> Result<(), String> {
             AGENT_LAB_OLLAMA_MODEL,
         ])
         .env("OPENJARVIS_NO_UPDATE_CHECK", "1")
+        .env("OPENJARVIS_AGENT_LAB_ALLOW_REPO_PATH", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .current_dir(root)
@@ -1357,6 +1358,7 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         }
     }
     cmd.args(&serve_argv)
+        .env("OPENJARVIS_AGENT_LAB_ALLOW_REPO_PATH", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .current_dir(root);

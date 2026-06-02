@@ -35,6 +35,10 @@ import type { ModelInfo, ToolCallInfo } from '../types';
 
 type EngineChoice = 'auto' | 'current' | 'ollama' | 'mlx';
 type ServiceAction = 'ollama' | 'mlx' | 'api' | 'all';
+const REPO_BACKED_SCENARIOS = new Set([
+  'repo-triage-workbench',
+  'repo-release-readiness-agent',
+]);
 
 function statusTone(status?: SampleRunResult['status']) {
   if (status === 'passed') return 'var(--color-success)';
@@ -43,13 +47,23 @@ function statusTone(status?: SampleRunResult['status']) {
   return 'var(--color-text-tertiary)';
 }
 
+function stringifyToolValue(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function asToolCallInfo(item: unknown, index: number): ToolCallInfo {
   const raw = (item || {}) as Record<string, unknown>;
   return {
     id: String(raw.id || `sample-tool-${index}`),
     tool: String(raw.name || raw.tool || 'tool_call'),
-    arguments: String(raw.arguments || ''),
-    result: raw.result === undefined ? undefined : String(raw.result),
+    arguments: stringifyToolValue(raw.arguments),
+    result: raw.result === undefined ? undefined : stringifyToolValue(raw.result),
     status: raw.success === false ? 'error' : 'success',
   };
 }
@@ -75,6 +89,7 @@ export function AgentLabPage() {
   const [model, setModel] = useState('');
   const [maxTurns, setMaxTurns] = useState(10);
   const [temperature, setTemperature] = useState(0.3);
+  const [repoPath, setRepoPath] = useState(() => localStorage.getItem('agent-lab-repo-path') || '');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [running, setRunning] = useState(false);
   const [serviceStatus, setServiceStatus] = useState<AgentLabServiceStatus | null>(null);
@@ -136,6 +151,7 @@ export function AgentLabPage() {
   );
   const canRun = !!selectedScenario && apiReady === true && !running;
   const toolCalls = (result?.tool_calls || []).map(asToolCallInfo);
+  const isRepoBacked = !!selectedScenario && REPO_BACKED_SCENARIOS.has(selectedScenario.id);
 
   function selectScenario(scenario: SampleScenario) {
     setSelectedId(scenario.id);
@@ -146,6 +162,8 @@ export function AgentLabPage() {
 
   async function runScenario() {
     if (!selectedScenario) return;
+    const trimmedRepoPath = repoPath.trim();
+    if (trimmedRepoPath) localStorage.setItem('agent-lab-repo-path', trimmedRepoPath);
     setRunning(true);
     setError('');
     setResult({
@@ -172,6 +190,7 @@ export function AgentLabPage() {
         model: model || undefined,
         max_turns: maxTurns,
         temperature,
+        repo_path: isRepoBacked && trimmedRepoPath ? trimmedRepoPath : undefined,
       });
       setResult(next);
     } catch (err: unknown) {
@@ -544,6 +563,23 @@ export function AgentLabPage() {
                 </div>
               )}
 
+              {isRepoBacked && (
+                <label className="mt-4 block text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+                  Repository path
+                  <input
+                    value={repoPath}
+                    onChange={(event) => setRepoPath(event.target.value)}
+                    placeholder="/Users/you/path/to/repo"
+                    className="mt-1 w-full rounded-md bg-transparent px-3 py-2 text-sm focus:outline-none focus:ring-2"
+                    style={{ border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                    aria-label="Repository path for repo-backed sample run"
+                  />
+                  <span className="mt-1 block text-xs leading-5" style={{ color: 'var(--color-text-tertiary)' }}>
+                    Leave blank to inspect the repo that started the OpenJarvis API.
+                  </span>
+                </label>
+              )}
+
               <label className="mt-4 block text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
                 Prompt
                 <textarea
@@ -641,7 +677,7 @@ export function AgentLabPage() {
                 <div className="mt-4">
                   <div className="mb-2 flex items-center gap-2 text-sm font-medium" style={{ color: 'var(--color-text)' }}>
                     <Settings2 size={15} />
-                    Tool Timeline
+                    {toolCalls.length > 0 ? 'Tool Timeline' : 'Expected Tools'}
                   </div>
                   {toolCalls.length > 0 ? (
                     <div className="space-y-2">
@@ -650,13 +686,18 @@ export function AgentLabPage() {
                       ))}
                     </div>
                   ) : (
-                    <div className="flex flex-wrap gap-2">
-                      {(result.allowed_tools || selectedScenario?.allowed_tools || []).map((tool) => (
-                        <span key={tool} className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs" style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}>
-                          <Clipboard size={12} />
-                          {tool}
-                        </span>
-                      ))}
+                    <div className="space-y-2">
+                      <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+                        No runtime tool calls were emitted for this sample run.
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {(result.allowed_tools || selectedScenario?.allowed_tools || []).map((tool) => (
+                          <span key={tool} className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs" style={{ border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)' }}>
+                            <Clipboard size={12} />
+                            {tool}
+                          </span>
+                        ))}
+                      </div>
                     </div>
                   )}
                 </div>

@@ -438,6 +438,114 @@ Still to confirm:
 
 - Run a sample with Advanced engine set to MLX and verify the result header says MLX.
 
+### 12.3 Repo-backed Agent Lab runs
+
+After the initial smoke-agent work, Agent Lab was extended from prompt-only samples to real read-only local repository workflows.
+
+New repo-backed samples:
+
+- `Repo Triage Workbench`
+- `Repo Release Readiness Agent`
+
+These scenarios now gather local repo evidence before generation:
+
+- list repository files with `repo_list`
+- inspect current working tree with `git_status`
+- search relevant code/docs with `repo_search`
+- read likely files with `file_read`
+- pass the evidence into the selected local/model engine
+
+The UI now distinguishes actual runtime tool calls from expected tools:
+
+- real repo-backed runs show `Tool Timeline`
+- simple prompt-only smoke samples show `Expected Tools`
+
+This fixed an important honesty gap in the earlier Agent Lab UI: older sample agents listed tools but did not actually execute them.
+
+### 12.4 Repo path picker
+
+Agent Lab now supports running repo-backed samples against another local repo from the UI.
+
+For `Repo Triage Workbench` and `Repo Release Readiness Agent`, the page shows a `Repository path` field.
+
+Example tested path:
+
+```text
+/Users/ln-mini/Downloads/mcp-server-tmdb
+```
+
+Behavior:
+
+- If the field is blank, Agent Lab inspects the repo that started the OpenJarvis API.
+- If the field has a path, the backend inspects that repo.
+- The path is persisted in browser local storage as `agent-lab-repo-path`.
+- The Tauri launcher now starts the API with `OPENJARVIS_AGENT_LAB_ALLOW_REPO_PATH=1`, so desktop-managed API runs support custom paths.
+
+Security note:
+
+- The backend blocks arbitrary `repo_path` by default unless `OPENJARVIS_AGENT_LAB_ALLOW_REPO_PATH=1` is set.
+- This keeps browser-origin requests from casually enumerating local paths unless the local developer explicitly enables it.
+
+Relevant files:
+
+- `frontend/src/pages/AgentLabPage.tsx`
+- `frontend/src/lib/api.ts`
+- `frontend/src-tauri/src/lib.rs`
+- `src/openjarvis/server/sample_runs.py`
+
+### 12.5 TMDB repo release-readiness validation
+
+The `Repo Release Readiness Agent` was manually tested against:
+
+```text
+/Users/ln-mini/Downloads/mcp-server-tmdb
+```
+
+Exported sample result reviewed:
+
+```text
+/Users/ln-mini/Downloads/sample-b0a4efc157eb.json
+```
+
+The run completed successfully:
+
+- scenario: `repo-release-readiness-agent`
+- status: `passed`
+- repo path: `/Users/ln-mini/Downloads/mcp-server-tmdb`
+- tool calls included `repo_list`, `git_status`, `repo_search`, and multiple `file_read` calls
+
+Files read by the improved evidence collector included:
+
+- `README.md`
+- `package.json`
+- `tsconfig.json`
+- `src/index.ts`
+- `src/worker.ts`
+- `plugins/tmdb/README.md`
+
+Quality assessment:
+
+- The report was credible and grounded enough for a first-pass release review.
+- It correctly identified the repo as a TMDB MCP server.
+- It correctly flagged version mismatch:
+  - `package.json`: `1.0.0`
+  - `src/index.ts`: `2.0.0`
+  - `src/worker.ts`: `2.0.0`
+- It correctly identified untracked files:
+  - `.DS_Store`
+  - `CODEX_ACTIVITY_NOTE.md`
+- It correctly noticed that docs reference `.env.example`, while the file was not present in the repo listing.
+- It correctly extracted build/test scripts from `package.json`.
+
+Known response caveat:
+
+- The agent framed missing `dist/` as a release blocker. That is directionally useful, but a more precise release-readiness wording is: build output is not currently present, so release readiness requires running `npm run build` and verifying `dist/index.js`.
+
+Improvement made after review:
+
+- The release-readiness evidence collector was updated to read project metadata and version-bearing files automatically when the prompt is release-focused.
+- This reduced over-inference from search snippets and made the second TMDB response more grounded than the first.
+
 ## 13. Current How-To: Launch Next Time
 
 ### Desktop app path
@@ -473,6 +581,32 @@ http://127.0.0.1:5173/agent-lab
 ```
 
 Browser-only mode can inspect readiness and run samples if the backend is already running, but it cannot start or stop Ollama, MLX, or the OpenJarvis API.
+
+### Running Agent Lab against another repo
+
+For repo-backed samples, use the `Repository path` field in Agent Lab.
+
+Example:
+
+```text
+/Users/ln-mini/Downloads/mcp-server-tmdb
+```
+
+Then run either:
+
+- `Repo Release Readiness Agent`
+- `Repo Triage Workbench`
+
+If starting the backend manually and you want to allow custom repo paths, start it with:
+
+```bash
+OPENJARVIS_AGENT_LAB_ALLOW_REPO_PATH=1 \
+uv run --extra server jarvis serve \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --engine ollama \
+  --model qwen3.5:9b
+```
 
 ## 14. Current How-To: Confirm MLX End to End
 
@@ -565,9 +699,9 @@ The desktop app now syncs the required extra before starting MLX.
 
    MLX service is Ready, but the shown sample result used Ollama. Run a sample with Advanced engine set to MLX and confirm the result header.
 
-2. Agent Lab sample agents are smoke-test scenarios, not full real-world agents yet.
+2. Agent Lab now includes two real read-only repo workflows, but they still stop short of guarded code edits.
 
-   They are useful for validating local agent behavior, but the next step is a real end-to-end use case with real local files or real connected data.
+   `Repo Triage Workbench` and `Repo Release Readiness Agent` inspect real local repos and produce grounded reports, but they do not yet run verification commands or propose/apply patches through an approval flow.
 
 3. Live connector tests remain separate.
 
@@ -577,9 +711,9 @@ The desktop app now syncs the required extra before starting MLX.
 
    `cargo check` passes, but the `objc` macro warnings still print. These appear to be existing dependency/macro warnings rather than a functional failure.
 
-5. `uv.lock` changed substantially during dependency work.
+5. Some verification commands can be too strong for read-only mode.
 
-   This should be reviewed before committing to make sure the lockfile change is expected and not accidental churn.
+   For example, `npm run build` can write `dist/`. The next step should add an explicit "allow verification commands" toggle before executing build/test commands.
 
 ## 17. Recommended Next Steps
 
@@ -594,7 +728,19 @@ Success criteria:
 - Result header shows MLX.
 - QA checks pass.
 
-### Step 2: Build one real end-to-end agent use case
+### Step 2: Add optional verification-command execution
+
+The release-readiness agent is now useful in read-only mode. The next major capability is an explicit verification mode:
+
+- user enables `Allow verification commands`
+- backend runs a limited allowlist such as `npm test`, `npm run build`, `uv run pytest`, or `ruff check`
+- output is captured as tool evidence
+- commands are time-limited
+- write-producing commands are clearly labeled
+
+This would turn the release-readiness agent from advisory to evidence-backed.
+
+### Step 3: Build one real end-to-end agent use case
 
 The next useful milestone is a real local agent, not another smoke prompt.
 
@@ -627,7 +773,7 @@ Reason:
 - It directly improves this project.
 - It can test tools, file reading, shell command planning, and QA checks.
 
-### Step 3: Add persisted run history
+### Step 4: Add persisted run history
 
 Agent Lab currently shows the current run well. The next improvement is a persistent run history:
 
@@ -637,7 +783,7 @@ Agent Lab currently shows the current run well. The next improvement is a persis
 - Allow export as Markdown.
 - Compare Ollama vs MLX runs.
 
-### Step 4: Add a real benchmark panel
+### Step 5: Add a real benchmark panel
 
 For Apple Silicon tuning, add:
 
@@ -652,7 +798,7 @@ For Apple Silicon tuning, add:
 
 This would make Agent Lab useful as both an agent QA UI and a local inference comparison tool.
 
-### Step 5: Package the desktop flow
+### Step 6: Package the desktop flow
 
 Eventually, move from `npm run tauri dev` to a packaged local app:
 
@@ -669,6 +815,11 @@ Completed:
 - Sample agent templates.
 - Backend sample-run API.
 - Local validators.
+- Real repo-backed `Repo Triage Workbench`.
+- Real repo-backed `Repo Release Readiness Agent`.
+- Repository path picker for repo-backed samples.
+- Actual tool timeline for repo-backed runs.
+- Expected-tools labeling for prompt-only smoke samples.
 - Ollama path.
 - MLX service launcher.
 - Tauri service start/stop controls.
@@ -684,6 +835,8 @@ Working now:
 - Ollama sample run passes.
 - OpenJarvis API is managed and ready.
 - MLX service is managed and ready.
+- Repo Release Readiness Agent can inspect another repo by path.
+- Repo Triage Workbench can inspect another repo by path.
 
 Needs final confirmation:
 
@@ -691,4 +844,4 @@ Needs final confirmation:
 
 Recommended next build:
 
-- Real Local Repo Maintainer end-to-end agent flow with run history and Ollama-vs-MLX comparison.
+- Guarded verification-command execution for repo-backed Agent Lab runs, followed by run history and Ollama-vs-MLX comparison.
