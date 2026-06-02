@@ -382,6 +382,7 @@ export interface SampleRunResult {
   checks: { key: string; label: string; passed: boolean }[];
   tool_calls: unknown[];
   allowed_tools?: string[];
+  repo_path?: string;
   usage: Record<string, unknown>;
   latency_seconds: number;
   trace_id: string | null;
@@ -626,6 +627,7 @@ export async function executeSampleRun(
     max_turns?: number;
     temperature?: number;
     tools?: string[];
+    repo_path?: string;
   },
 ): Promise<SampleRunResult> {
   const res = await fetch(`${getBase()}/v1/sample-runs/${scenarioId}/execute`, {
